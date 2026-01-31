@@ -41,7 +41,7 @@ class ServiceManager:
         if service_id in services_dict:
             return "Service already registered", 409
         # update services_status
-        new_service = Service(service_id, service_data['image'], service_data['num_gpus'], service_data['sm_requests'], service_data['sm_limits'], service_data['memory'], service_data['is_llm'], service_data['priority'], service_data['task_type'], service_data['throughput'], service_data['commands'])
+        new_service = Service(service_id, service_data['image'], service_data.get('num_npus', service_data.get('num_gpus', 1)), service_data.get('cube_requests', service_data.get('sm_requests', 0.25)), service_data.get('cube_limits', service_data.get('sm_limits', 0.75)), service_data.get('vector_requests', 0.25), service_data.get('vector_limits', 0.75), service_data['memory'], service_data['is_llm'], service_data['priority'], service_data['task_type'], service_data['throughput'], service_data['commands'])
         services_dict[service_id] = new_service
         services_status[service_id] = {"requests": 0}
         
@@ -109,12 +109,14 @@ def handle_predict(service_id):
 
 
 class Service:
-    def __init__(self, service_id, image, num_gpus, sm_requests, sm_limits, memory, is_llm, priority, task_type, throughput, commands):
+    def __init__(self, service_id, image, num_npus, cube_requests, cube_limits, vector_requests, vector_limits, memory, is_llm, priority, task_type, throughput, commands):
         self.service_id = service_id
         self.image = image
-        self.num_gpus = num_gpus
-        self.sm_requests = sm_requests
-        self.sm_limits = sm_limits
+        self.num_npus = num_npus
+        self.cube_requests = cube_requests
+        self.cube_limits = cube_limits
+        self.vector_requests = vector_requests
+        self.vector_limits = vector_limits
         self.memory = memory
         self.is_llm = is_llm
         self.priority = priority
@@ -130,9 +132,11 @@ class Service:
     def scale_out(self):
         url = f"{scheduler_url}/schedule"
         data = {
-            'num': self.num_gpus,
-            'sm_requests': self.sm_requests,
-            'sm_limits': self.sm_limits,
+            'num': self.num_npus,
+            'cube_requests': self.cube_requests,
+            'cube_limits': self.cube_limits,
+            'vector_requests': self.vector_requests,
+            'vector_limits': self.vector_limits,
             'memory': self.memory,
             'is_llm': self.is_llm,
             'priority': self.priority,
@@ -145,7 +149,7 @@ class Service:
         if response.status_code == 200:
             resp_content = response.json()
             instance_id = resp_content.get('instance_id')
-            ip_address = resp_content.get('selected_gpus')[0]['ip']
+            ip_address = resp_content.get('selected_npus')[0]['ip']
             port = resp_content.get('port')
             instance = {"instance_id": instance_id, "ip_address": ip_address, "port": port, "is_ready": False}
             self.instances.append(instance)

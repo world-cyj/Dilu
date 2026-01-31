@@ -1,54 +1,98 @@
 import subprocess
-import shlex   
+import os
+import shlex
+import tempfile
 
-def start_instance(selected_gpus, instance_id, image_name, service_name, args, allocated_port, ip_address):
-    gpus = ','.join([str(gpu['index']) for gpu in selected_gpus])
-
-    volumes = {
-        '/home/lvcunchi/Dilu_sys/Dilu_node_scheduler': '/cluster', # for dilu
-        '/home/lvcunchi/Dilu_sys/gsharing': '/etc/gsharing',
-        '/home/lvcunchi/benchmarks/dilu_benchmarks/gdGPT_container/': '/gdGPT_container',
-        '/home/lvcunchi/benchmarks/models/': '/cluster/models', 
-        '/home/lvcunchi/Dilu_sys/cluster_logs': '/cluster/workloads/job_logs',
-        '/usr/local/cuda-11.7': '/usr/local/cuda',
-    }
-    environment = {
-        'CUDA_MPS_PIPE_DIRECTORY': '/tmp/nvidia-mps', # for MPS
-        'CUDA_VISIBLE_DEVICES': gpus,  # for MPS
-        'requests_rate': str(args.get('sm_requests', 0.25)),
-        'limits_rate': str(args.get('sm_limits', 0.75)),
-        'is_llm': str(args.get('is_llm', 0)),
-        'priority': args.get('priority', 'low'),
-    }
+def start_instance(selected_npus, instance_id, image_name, service_name, args, allocated_port, ip_address):
+    npu_indices = ','.join([str(npu['index']) for npu in selected_npus])
+    
+    cube_requests = str(args.get('cube_requests', 0.25))
+    cube_limits = str(args.get('cube_limits', 0.75))
+    vector_requests = str(args.get('vector_requests', 0.25))
+    vector_limits = str(args.get('vector_limits', 0.75))
+    is_llm = str(args.get('is_llm', 0))
+    priority = args.get('priority', 'low')
     
     if "deepspeed" not in service_name:
-        command = args.get('COMMAND', '') + " --port {} ".format(allocated_port)
+        command = args.get('COMMAND', '') + f" --port {allocated_port} "
     else:
         command = args.get('COMMAND', '') 
+    
+    log_file = f'/vllm-workspace/Dilu/workloads/job_logs/{service_name}-{instance_id}.log'
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(f'''
+import os
+import subprocess
+import acl
+import acldvpp
+
+npu_index = {npu_indices.split(',')[0]}
+acldvpp.set_device(npu_index)
+acl.rt.set_device(npu_index)
+
+cube_core_count = int({cube_limits} * 100)
+vector_core_count = int({vector_limits} * 100)
+acl.rt.set_device_res_limit(npu_index, acl.RT_ACL_RES_TYPE_CUBE, cube_core_count)
+acl.rt.set_device_res_limit(npu_index, acl.RT_ACL_RES_TYPE_VECTOR, vector_core_count)
+
+os.environ['ACL_DEVICE_INDEX'] = str(npu_index)
+os.environ['requests_rate'] = '{cube_requests}'
+os.environ['limits_rate'] = '{cube_limits}'
+os.environ['is_llm'] = '{is_llm}'
+os.environ['priority'] = '{priority}'
+
+command = {shlex.quote(command)}
+log_file = {shlex.quote(log_file)}
+
+print(f"Executing command: {{command}}")
+print(f"Logging to: {{log_file}}")
+
+with open(log_file, 'w') as log:
+    process = subprocess.Popen(
+        command, 
+        shell=True, 
+        stdout=log, 
+        stderr=log
+    )
+    
+pid_file = f'/vllm-workspace/Dilu/workloads/pids/{service_name}-{instance_id}.pid'
+os.makedirs(os.path.dirname(pid_file), exist_ok=True)
+with open(pid_file, 'w') as f:
+    f.write(str(process.pid))
+        ''')
+        temp_script_path = f.name
+    
+    try:
+        python_command = f"python3 {temp_script_path}"
+        print(f"Executing Python command: {{python_command}}")
+        result = subprocess.run(python_command, shell=True, capture_output=True, text=True)
         
-    docker_command = f"docker run --name {service_name}-{instance_id} --gpus device=all --ipc host --network host --cap-add SYS_NICE -u root --shm-size 32g -d"
-    for host_path, container_path in volumes.items():
-        docker_command += f" -v {shlex.quote(host_path)}:{shlex.quote(container_path)}"
-    for key, value in environment.items():
-        docker_command += f" -e {shlex.quote(key)}={shlex.quote(value)}"
-    output_file = f'/cluster/workloads/job_logs/{service_name}-{instance_id}.log'
-    docker_command += f" {image_name} bash -c '{command} > {output_file} 2>&1'"
-
-    print(f"Generated Docker command: {docker_command}")
-
-    ssh_command = f"ssh {ip_address} {shlex.quote(docker_command)}"
-    print(f"Executing SSH command: {ssh_command}")
-    result = subprocess.run(ssh_command, shell=True, capture_output=True, text=True)
-
-    print(f"SSH command output: {result.stdout}")
-    print(f"SSH command error: {result.stderr}")
-    print(f"SSH command return code: {result.returncode}")
-
-    if result.returncode != 0:
-        raise RuntimeError(f"SSH command failed with return code {result.returncode}")
-
+        print(f"Python command output: {{result.stdout}}")
+        print(f"Python command error: {{result.stderr}}")
+        print(f"Python command return code: {{result.returncode}}")
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Python command failed with return code {{result.returncode}}")
+    finally:
+        os.unlink(temp_script_path)
 
 def stop_instance(service_name, instance_id, ip_address):
-    docker_name = f"{service_name}-{instance_id}"
-    ssh_command = f"ssh {ip_address} 'docker stop {docker_name} && docker rm {docker_name}  '"
-    subprocess.run(ssh_command, shell=True)
+    pid_file = f'/vllm-workspace/Dilu/workloads/pids/{service_name}-{instance_id}.pid'
+    if os.path.exists(pid_file):
+        with open(pid_file, 'r') as f:
+            try:
+                pid = int(f.read().strip())
+                subprocess.run(['kill', '-9', str(pid)], capture_output=True)
+                print(f"Stopped instance {instance_id} with PID {pid}")
+            except ValueError:
+                print(f"Invalid PID in file {{pid_file}}")
+        os.unlink(pid_file)
+    else:
+        print(f"PID file not found: {{pid_file}}")
+    
+    log_file = f'/vllm-workspace/Dilu/workloads/job_logs/{service_name}-{instance_id}.log'
+    if os.path.exists(log_file):
+        os.unlink(log_file)
+        print(f"Removed log file: {{log_file}}")

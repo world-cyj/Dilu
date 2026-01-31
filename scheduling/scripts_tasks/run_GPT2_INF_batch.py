@@ -2,9 +2,21 @@ from flask import Flask, request, jsonify
 import argparse
 import torch
 import os
+import sys
 import threading
 import time
 import queue
+
+# 尝试导入torch_npu，如果不可用则使用ACL
+try:
+    import torch_npu
+    NPU_AVAILABLE = True
+except ImportError:
+    try:
+        import acl
+        NPU_AVAILABLE = True
+    except ImportError:
+        NPU_AVAILABLE = False
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 from concurrent.futures import ThreadPoolExecutor
 
@@ -25,8 +37,21 @@ tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, config=config)
 model.resize_token_embeddings(len(tokenizer))
 model.config.pad_token_id=50256
-args.device = "cuda:" + str(args.device)
-model.to(args.device)
+
+# 设置设备
+if NPU_AVAILABLE:
+    if 'torch_npu' in sys.modules:
+        args.device = "npu:" + str(args.device)
+        model = model.to(args.device)
+    else:
+        # 使用ACL设置设备
+        device_id = args.device
+        acl.init()
+        acl.rt.set_device(device_id)
+        args.device = device_id
+else:
+    args.device = "cuda:" + str(args.device) if torch.cuda.is_available() else "cpu"
+    model.to(args.device)
 model.eval()
 
 batch_queue = []
@@ -93,17 +118,41 @@ def inference(texts):
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    if device.type == 'cuda':
-        torch.cuda.set_device(device)
-        allocated_memory = torch.cuda.memory_allocated(device) / (1024 ** 3)  
-        print("allocated_memory: ", allocated_memory)
-        if allocated_memory > 3.1: 
-            return jsonify({'status': 'healthy'}), 200
+    if NPU_AVAILABLE:
+        if 'torch_npu' in sys.modules:
+            # 使用torch_npu检查
+            device = torch.device(args.device)
+            allocated_memory = torch.npu.memory_allocated(device) / (1024 ** 3)  
+            print("allocated_memory: ", allocated_memory)
+            if allocated_memory > 3.1: 
+                return jsonify({'status': 'healthy'}), 200
+            else:
+                return jsonify({'status': 'unhealthy', 'reason': 'Not enough NPU memory allocated'}), 503
         else:
-            return jsonify({'status': 'unhealthy', 'reason': 'Not enough GPU memory allocated'}), 503
+            # 使用ACL检查
+            try:
+                device_id = args.device
+                # 检查设备是否可用
+                ret = acl.rt.device_reset(device_id)
+                if ret == 0:
+                    return jsonify({'status': 'healthy'}), 200
+                else:
+                    return jsonify({'status': 'unhealthy', 'reason': 'NPU device not available'}), 503
+            except Exception as e:
+                return jsonify({'status': 'unhealthy', 'reason': str(e)}), 503
     else:
-        return jsonify({'status': 'unhealthy', 'reason': 'GPU not available'}), 503
+        # 回退到GPU检查
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        if device.type == 'cuda':
+            torch.cuda.set_device(device)
+            allocated_memory = torch.cuda.memory_allocated(device) / (1024 ** 3)  
+            print("allocated_memory: ", allocated_memory)
+            if allocated_memory > 3.1: 
+                return jsonify({'status': 'healthy'}), 200
+            else:
+                return jsonify({'status': 'unhealthy', 'reason': 'Not enough GPU memory allocated'}), 503
+        else:
+            return jsonify({'status': 'unhealthy', 'reason': 'No acceleration device available'}), 503
 
 
 @app.route('/predict', methods=['POST'])

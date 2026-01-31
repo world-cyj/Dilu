@@ -1,0 +1,1 @@
+"""NPU profiling module"""

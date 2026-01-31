@@ -32,6 +32,24 @@ See the README.md files of each subfolder for more details. The main steps are a
 3. Deploy train/inference tasks.
 4. Generate inference workloads.
 
+---
+
+## NPU 迁移（华为 910B3）
+
+在单机 4 张 910B3 NPU、单容器内无 Docker 的场景下，提供 NPU 版调度与 demo 雏形：
+
+- **资源模型**：每卡 20 Cube Core + 40 Vector Core + 64GB 显存，通过 ACL `set_device_res_limit` 做核心与显存管控。
+- **调度**：`scheduling/scheduler_npu.py`（Best-Fit/Worst-Fit）、`scheduling/scaler_npu.py`，API 使用 `cube_requests/limits`、`vector_requests/limits`、`memory`。
+- **实例启动**：本机子进程 + 环境变量传设备与配额，子进程内先 ACL 设限再启动 HTTP 服务（`scheduling/utils_npu.py`、`scheduling/scripts_demo/npu_worker_entry.py`）。
+
+**快速跑 NPU Demo：**
+
+```bash
+cd scheduling && export PYTHONPATH=$PWD && python3 scripts_demo/run_demo_npu.py
+```
+
+详见 [docs/README_NPU_DEMO.md](docs/README_NPU_DEMO.md) 与 [docs/NPU_MIGRATION_FILE_LIST.md](docs/NPU_MIGRATION_FILE_LIST.md)。
+
 ## Citation
 
 ```bibtex

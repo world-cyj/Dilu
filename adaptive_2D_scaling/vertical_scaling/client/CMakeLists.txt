@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(hijack C CXX)
 
 add_definitions(-D_GNU_SOURCE)
