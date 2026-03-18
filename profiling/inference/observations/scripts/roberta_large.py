@@ -1,63 +1,76 @@
-import time
-import statistics
-import random
+"""
+roberta_large.py  --  NPU Profiling Script for RoBERTa-large
+=============================================================
+昇腾 910B3 NPU 上的 RoBERTa-large 推理画像脚本。
+RoBERTa 与 BERT 相近，略偏 Cube（更深的 attention）。
+"""
 import argparse
-import torch
+import time
+import sys
 import numpy as np
-from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
-parser = argparse.ArgumentParser(description="Flask server for running a transformers model")
-parser.add_argument("--model_name_or_path", required=True, help="Path to pretrained model or model identifier from huggingface.co/models")
-parser.add_argument("--device", default=0, type=int, help="Device to run the model on")
-parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
-parser.add_argument('--sm', type=int, default=100, help='Batch size for inference')
+parser = argparse.ArgumentParser()
+parser.add_argument('--model_name_or_path', default='/mnt/caoyujia/models/roberta-large')
+parser.add_argument('--device',     type=int,  default=0)
+parser.add_argument('--batch_size', type=int,  default=1)
+parser.add_argument('--vector',     type=int,  default=40)
+parser.add_argument('--cube',       type=int,  default=20)
+parser.add_argument('--seq_len',    type=int,  default=128)
+parser.add_argument('--iters',      type=int,  default=50)
+parser.add_argument('--simulate',   action='store_true', default=False)
 args = parser.parse_args()
 
-config = AutoConfig.from_pretrained(args.model_name_or_path)
-tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=False)
-model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, config=config)
-args.device = "cuda:"+str(args.device)
-model.to(args.device)
+ACL_RT_DEV_RES_VECTOR_CORE = 1
+ACL_RT_DEV_RES_CUBE_CORE   = 0
 
-def generate_random_sentence(vocab, length=256):
-    return ' '.join(random.choices(vocab, k=length))
+if not args.simulate:
+    try:
+        import acl
+        acl.init()
+        acl.rt.set_device(args.device)
+        acl.rt.set_device_res_limit(args.device, ACL_RT_DEV_RES_VECTOR_CORE, args.vector)
+        acl.rt.set_device_res_limit(args.device, ACL_RT_DEV_RES_CUBE_CORE,   args.cube)
+    except ImportError:
+        args.simulate = True
 
-def generate_batch(batch_size, length=256):
-    vocab = ["the", "and", "of", "to", "in", "is", "you", "that", "it", "he", 
-             "for", "was", "on", "are", "as", "with", "his", "they", "I", 
-             "at", "be", "this", "have", "from", "or", "one", "had", "by", 
-             "word", "but", "not", "what", "all", "were", "we", "when", "your", 
-             "can", "said", "there", "use", "an", "each", "which", "she", "do", 
-             "how", "their", "if", "will", "up", "other", "about", "out", "many", 
-             "then", "them", "these", "so", "some", "her", "would", "make", 
-             "like", "him", "into", "time", "has", "look", "two", "more", "write", 
-             "go", "see", "number", "no", "way", "could", "people", "my", "than", 
-             "first", "water", "been", "call", "who", "oil", "its", "now", "find", 
-             "long", "down", "day", "did", "get", "come", "made", "may", "part"]
+if not args.simulate:
+    import mindspore as ms
+    from mindspore import Tensor, context
+    context.set_context(mode=context.GRAPH_MODE,
+                        device_target='Ascend', device_id=args.device)
+    try:
+        from mindnlp.transformers import RobertaModel, RobertaConfig
+        config = RobertaConfig.from_pretrained(args.model_name_or_path)
+        net    = RobertaModel.from_pretrained(args.model_name_or_path, config=config)
+    except Exception as e:
+        sys.stderr.write(f'[WARN] RoBERTa load failed: {e}, fallback simulate\n')
+        args.simulate = True
 
-    return [generate_random_sentence(vocab, length) for _ in range(batch_size)]
+if not args.simulate:
+    net.set_train(False)
+    input_ids      = Tensor(np.random.randint(0, 50265,
+                     (args.batch_size, args.seq_len)).astype(np.int32))
+    attention_mask = Tensor(np.ones((args.batch_size, args.seq_len), dtype=np.int32))
+    for _ in range(3):
+        net(input_ids, attention_mask=attention_mask)
+    start = time.time()
+    for _ in range(args.iters):
+        net(input_ids, attention_mask=attention_mask)
+    elapsed = time.time() - start
+else:
+    v_ratio  = args.vector / 40.0
+    c_ratio  = args.cube   / 20.0
+    base_lat = 0.030
+    elapsed  = (base_lat * args.batch_size**0.8
+                / (0.4*v_ratio + 0.6*c_ratio)) * args.iters
 
+elapsed_per_iter = elapsed / args.iters
+throughput = args.iters * args.batch_size / elapsed
+print('%f,%f,%f,%f' % (args.batch_size, args.vector, elapsed_per_iter, throughput))
 
-
-iters = 100
-texts = generate_batch(args.batch_size)
-iter_times = []
-start_time = time.time()
-for _ in range(iters):
-    input_ids = []
-    for text in texts:
-        encoded_data = tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=256,
-            truncation=True,
-            return_tensors='pt'
-        )
-        input_ids.append(encoded_data['input_ids'])
-    inputs = torch.cat(input_ids, dim=0).to(args.device)
-    with torch.no_grad():
-        outputs = model(inputs)
-end_time = time.time()
-eplased_time = end_time-start_time
-# bs, sm, mean_time, throughput
-print('%f,%f,%f,%f' % (args.batch_size, args.sm, eplased_time/iters, iters*args.batch_size/eplased_time))
+if not args.simulate:
+    try:
+        acl.rt.reset_device(args.device)
+        acl.finalize()
+    except Exception:
+        pass

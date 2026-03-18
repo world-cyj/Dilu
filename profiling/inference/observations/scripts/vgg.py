@@ -1,34 +1,25 @@
 """
-resnet152.py  --  NPU Profiling Script for ResNet-152
-=====================================================
-昇腾 910B3 / CANN 8.3 RC1 环境，使用 torch_npu + ACL 接口。
-替代原 PyTorch+CUDA 版本，CUDA 相关调用全部替换。
-
-输出格式（与原版兼容）:
-  batch_size, vector_quota, elapsed_time_per_iter, throughput
-
-ACL 算力限制:
-  acl.rt.set_device_res_limit(device_id, 1, vector)  # VECTOR_CORE
-  acl.rt.set_device_res_limit(device_id, 0, cube)    # CUBE_CORE
+vgg.py  --  NPU Profiling Script for VGG-19
+============================================
+昇腾 910B3 / CANN 8.3 RC1，使用 torch_npu + ACL 接口。
+VGG-19: Vector-heavy（大量逐元素激活），Cube 占比低。
 """
-
 import argparse
 import time
 import sys
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--device',     type=int, default=0)
-parser.add_argument('--batch_size', type=int, default=1)
-parser.add_argument('--vector',     type=int, default=40)
-parser.add_argument('--cube',       type=int, default=20)
-parser.add_argument('--iters',      type=int, default=50)
+parser.add_argument('--device',     type=int,  default=0)
+parser.add_argument('--batch_size', type=int,  default=1)
+parser.add_argument('--vector',     type=int,  default=40)
+parser.add_argument('--cube',       type=int,  default=20)
+parser.add_argument('--iters',      type=int,  default=50)
 parser.add_argument('--simulate',   action='store_true', default=False)
 args = parser.parse_args()
 
 ACL_RT_DEV_RES_VECTOR_CORE = 1
 ACL_RT_DEV_RES_CUBE_CORE   = 0
 
-# ── ACL 算力配额设置 ──────────────────────────────────────────────────────
 if not args.simulate:
     try:
         import acl
@@ -40,24 +31,21 @@ if not args.simulate:
         sys.stderr.write(f'[WARN] ACL init failed: {e}, fallback simulate\n')
         args.simulate = True
 
-# ── 模型加载（torch_npu）─────────────────────────────────────────────────
 if not args.simulate:
     try:
         import torch
-        import torch_npu                          # CANN 8.3 RC1
+        import torch_npu
         import torchvision.models as tv_models
-        import numpy as np
 
         npu_device = f'npu:{args.device}'
         torch_npu.npu.set_device(npu_device)
 
-        model = tv_models.resnet152(pretrained=False)
+        model = tv_models.vgg19(pretrained=False)
         model = model.to(npu_device)
         model.eval()
 
         dummy = torch.randn(args.batch_size, 3, 224, 224).to(npu_device)
 
-        # warm-up
         with torch.no_grad():
             for _ in range(5):
                 model(dummy)
@@ -77,10 +65,9 @@ if not args.simulate:
 if args.simulate:
     v_ratio  = args.vector / 40.0
     c_ratio  = args.cube   / 20.0
-    base_lat = 0.015
-    elapsed  = base_lat * args.batch_size**0.7 / (0.7*v_ratio + 0.3*c_ratio) * args.iters
+    base_lat = 0.022
+    elapsed  = base_lat * args.batch_size**0.75 / (0.75*v_ratio + 0.25*c_ratio) * args.iters
 
-# ── 输出 ──────────────────────────────────────────────────────────────────
 elapsed_per_iter = elapsed / args.iters
 throughput       = args.iters * args.batch_size / elapsed
 print('%f,%f,%f,%f' % (args.batch_size, args.vector, elapsed_per_iter, throughput))

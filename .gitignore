@@ -16,3 +16,19 @@ Makefile
 .vscode/
 
 .DS_Store
+# Data and model files
+evaluation/datasets/
+evaluation/models/
+**/datasets/
+**/models/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pkl
+*.npy
+*.npz
+*.csv
+*.txt
+*.json
+*.png

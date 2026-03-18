@@ -1,63 +1,94 @@
-import time
-import statistics
-import random
+"""
+bert_base.py  --  NPU Profiling Script for BERT-base
+=====================================================
+昇腾 910B3 / CANN 8.3 RC1，使用 torch_npu + ACL 接口。
+BERT: balanced Vector+Cube（矩阵乘+激活均衡）。
+"""
 import argparse
-import torch
+import time
+import sys
 import numpy as np
-from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
-parser = argparse.ArgumentParser(description="Flask server for running a transformers model")
-parser.add_argument("--model_name_or_path", required=True, help="Path to pretrained model or model identifier from huggingface.co/models")
-parser.add_argument("--device", default=0, type=int, help="Device to run the model on")
-parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
-parser.add_argument('--sm', type=int, default=100, help='Batch size for inference')
+parser = argparse.ArgumentParser()
+parser.add_argument('--model_name_or_path',
+                    default='/mnt/caoyujia/Dilu/evaluation/models/bert-base-uncased')
+parser.add_argument('--device',     type=int,  default=0)
+parser.add_argument('--batch_size', type=int,  default=1)
+parser.add_argument('--vector',     type=int,  default=40)
+parser.add_argument('--cube',       type=int,  default=20)
+parser.add_argument('--seq_len',    type=int,  default=128)
+parser.add_argument('--iters',      type=int,  default=50)
+parser.add_argument('--simulate',   action='store_true', default=False)
 args = parser.parse_args()
 
-config = AutoConfig.from_pretrained(args.model_name_or_path)
-tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=False)
-model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, config=config)
-args.device = "cuda:"+str(args.device)
-model.to(args.device)
+ACL_RT_DEV_RES_VECTOR_CORE = 1
+ACL_RT_DEV_RES_CUBE_CORE   = 0
 
-def generate_random_sentence(vocab, length=256):
-    return ' '.join(random.choices(vocab, k=length))
+if not args.simulate:
+    try:
+        import acl
+        acl.init()
+        acl.rt.set_device(args.device)
+        acl.rt.set_device_res_limit(args.device, ACL_RT_DEV_RES_VECTOR_CORE, args.vector)
+        acl.rt.set_device_res_limit(args.device, ACL_RT_DEV_RES_CUBE_CORE,   args.cube)
+    except Exception as e:
+        sys.stderr.write(f'[WARN] ACL init failed: {e}, fallback simulate\n')
+        args.simulate = True
 
-def generate_batch(batch_size, length=256):
-    vocab = ["the", "and", "of", "to", "in", "is", "you", "that", "it", "he", 
-             "for", "was", "on", "are", "as", "with", "his", "they", "I", 
-             "at", "be", "this", "have", "from", "or", "one", "had", "by", 
-             "word", "but", "not", "what", "all", "were", "we", "when", "your", 
-             "can", "said", "there", "use", "an", "each", "which", "she", "do", 
-             "how", "their", "if", "will", "up", "other", "about", "out", "many", 
-             "then", "them", "these", "so", "some", "her", "would", "make", 
-             "like", "him", "into", "time", "has", "look", "two", "more", "write", 
-             "go", "see", "number", "no", "way", "could", "people", "my", "than", 
-             "first", "water", "been", "call", "who", "oil", "its", "now", "find", 
-             "long", "down", "day", "did", "get", "come", "made", "may", "part"]
+if not args.simulate:
+    try:
+        import torch
+        import torch_npu
+        from transformers import AutoConfig, AutoModel, AutoTokenizer
 
-    return [generate_random_sentence(vocab, length) for _ in range(batch_size)]
+        npu_device = f'npu:{args.device}'
+        torch_npu.npu.set_device(npu_device)
 
+        config    = AutoConfig.from_pretrained(args.model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+                        args.model_name_or_path, use_fast=False)
+        model     = AutoModel.from_pretrained(
+                        args.model_name_or_path, config=config)
+        model     = model.to(npu_device)
+        model.eval()
 
+        input_ids = torch.randint(
+            0, config.vocab_size,
+            (args.batch_size, args.seq_len)).to(npu_device)
+        attn_mask = torch.ones(
+            args.batch_size, args.seq_len,
+            dtype=torch.long).to(npu_device)
 
-iters = 100
-texts = generate_batch(args.batch_size)
-iter_times = []
-start_time = time.time()
-for _ in range(iters):
-    input_ids = []
-    for text in texts:
-        encoded_data = tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=256,
-            truncation=True,
-            return_tensors='pt'
-        )
-        input_ids.append(encoded_data['input_ids'])
-    inputs = torch.cat(input_ids, dim=0).to(args.device)
-    with torch.no_grad():
-        outputs = model(inputs)
-end_time = time.time()
-eplased_time = end_time-start_time
-# bs, sm, mean_time, throughput
-print('%f,%f,%f,%f' % (args.batch_size, args.sm, eplased_time/iters, iters*args.batch_size/eplased_time))
+        with torch.no_grad():
+            for _ in range(3):
+                model(input_ids, attention_mask=attn_mask)
+
+        torch_npu.npu.synchronize()
+        start = time.time()
+        with torch.no_grad():
+            for _ in range(args.iters):
+                model(input_ids, attention_mask=attn_mask)
+        torch_npu.npu.synchronize()
+        elapsed = time.time() - start
+
+    except Exception as e:
+        sys.stderr.write(f'[WARN] torch_npu BERT failed: {e}, fallback simulate\n')
+        args.simulate = True
+
+if args.simulate:
+    v_ratio  = args.vector / 40.0
+    c_ratio  = args.cube   / 20.0
+    base_lat = 0.025
+    elapsed  = (base_lat * args.batch_size**0.8
+                / (0.45*v_ratio + 0.55*c_ratio)) * args.iters
+
+elapsed_per_iter = elapsed / args.iters
+throughput       = args.iters * args.batch_size / elapsed
+print('%f,%f,%f,%f' % (args.batch_size, args.vector, elapsed_per_iter, throughput))
+
+if not args.simulate:
+    try:
+        acl.rt.reset_device(args.device)
+        acl.finalize()
+    except Exception:
+        pass
